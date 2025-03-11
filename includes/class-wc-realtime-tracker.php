@@ -34,6 +34,13 @@ class WC_Realtime_Tracker {
     private $geo;
     
     /**
+     * Flag to ensure checkout is only tracked once per page load
+     * 
+     * @var boolean
+     */
+    private $checkout_tracked = false;
+    
+    /**
      * Constructor
      *
      * @param WC_Realtime_DB $db Database handler
@@ -60,10 +67,14 @@ class WC_Realtime_Tracker {
         add_action('wp_ajax_wc_realtime_track', array($this, 'ajax_track_event'));
         add_action('wp_ajax_nopriv_wc_realtime_track', array($this, 'ajax_track_event'));
         
-        // Server-side tracking (for important events that bypass cache)
-        // These hooks are triggered even with cache because they modify the cart/session
-        add_action('woocommerce_add_to_cart', array($this, 'track_add_to_cart'), 10, 6);
-        add_action('woocommerce_before_checkout_form', array($this, 'track_checkout'));
+        // DISABLE server-side tracking for add_to_cart as it's handled by client-side
+        // add_action('woocommerce_add_to_cart', array($this, 'track_add_to_cart'), 10, 6);
+        
+        // Track checkout page visits directly (more reliable than button clicks)
+        // Use a late priority to ensure it only runs once
+        add_action('wp', array($this, 'track_checkout_page_visit'), 99);
+        
+        // Purchase tracking should stay server-side
         add_action('woocommerce_thankyou', array($this, 'track_purchase'));
         
         // Make sure our tracking endpoint doesn't get cached
@@ -107,9 +118,126 @@ class WC_Realtime_Tracker {
                 'pusher_cluster' => $this->pusher->get_cluster(),
                 'is_product' => is_product(),
                 'product_id' => $this->get_current_product_id(),
-                'session_id' => $this->get_or_create_session_id()
+                'session_id' => $this->get_or_create_session_id(),
+                'is_checkout' => is_checkout()
             )
         );
+    }
+    
+    /**
+     * Track checkout page visit
+     * This directly tracks when a user lands on the checkout page
+     */
+    public function track_checkout_page_visit() {
+        // Prevent multiple tracking in the same page load - this is critical
+        static $already_tracked = false;
+        if ($already_tracked) {
+            return;
+        }
+        
+        // Only track on the checkout page
+        if (!is_checkout()) {
+            return;
+        }
+        
+        // Skip tracking on AJAX requests and form submissions (to avoid duplicate tracking)
+        if ($this->is_ajax_request() || !empty($_POST)) {
+            return;
+        }
+        
+        // Check if this is a payment callback or thank you page
+        if (is_wc_endpoint_url('order-pay') || is_wc_endpoint_url('order-received') || is_wc_endpoint_url('thankyou')) {
+            return;
+        }
+        
+        // Ensure WooCommerce is fully loaded
+        if (!function_exists('WC') || !WC()->cart) {
+            return;
+        }
+        
+        // Get session ID
+        $session_id = $this->get_or_create_session_id();
+        
+        // Check if already tracked in this session using cookies
+        $cookie_name = 'wc_checkout_tracked';
+        if (isset($_COOKIE[$cookie_name]) && $_COOKIE[$cookie_name] === $session_id) {
+            return;
+        }
+        
+        // Get IP address
+        $ip_address = $this->get_client_ip();
+        
+        // Check for duplicate event more stringently - look for checkout events from same session in last 10 minutes
+        global $wpdb;
+        $table_name = $wpdb->prefix . 'wc_realtime_events';
+        $time_threshold = date('Y-m-d H:i:s', strtotime('-10 minutes'));
+        
+        $exists = $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM {$table_name} 
+            WHERE event_type = 'checkout' 
+            AND session_id = %s 
+            AND created_at >= %s",
+            $session_id,
+            $time_threshold
+        ));
+        
+        if ($exists > 0) {
+            return;
+        }
+        
+        // This is important - mark as already tracked to prevent duplication
+        $already_tracked = true;
+        
+        // Get country information
+        $geo_data = $this->geo->get_country_from_ip($ip_address);
+        
+        // Get cart data
+        $cart = WC()->cart;
+        $items = array();
+        
+        if ($cart) {
+            foreach ($cart->get_cart() as $cart_item_key => $cart_item) {
+                $product = $cart_item['data'];
+                if ($product) {
+                    $items[] = array(
+                        'product_id' => $product->get_id(),
+                        'name' => html_entity_decode($product->get_name(), ENT_QUOTES, 'UTF-8'),
+                        'quantity' => $cart_item['quantity'],
+                        'price' => $product->get_price()
+                    );
+                }
+            }
+        }
+        
+        // Prepare event data
+        $event_data = array(
+            'session_id' => $session_id,
+            'user_id' => get_current_user_id(),
+            'ip_address' => $ip_address,
+            'country_code' => isset($geo_data['country_code']) ? sanitize_text_field($geo_data['country_code']) : '',
+            'country_name' => isset($geo_data['country_name']) ? sanitize_text_field($geo_data['country_name']) : '',
+            'cart_total' => ($cart ? $cart->get_cart_contents_total() : 0),
+            'items' => $items
+        );
+        
+        // First save general checkout event (without specific product)
+        $event_id = $this->db->save_event('checkout', $event_data);
+        
+        if (!$event_id) {
+            return; // If primary event fails, don't proceed
+        }
+        
+        // Set httponly cookie to prevent duplicate tracking - use session ID as value
+        $secure = is_ssl();
+        setcookie($cookie_name, $session_id, time() + 3600, COOKIEPATH, COOKIE_DOMAIN, $secure, true);
+        
+        // Only track products if primary event succeeded - but we don't need per-product checkout events
+        // Removed to prevent multiple entries for a single checkout
+        
+        // Send event via Pusher
+        if ($this->pusher->is_configured()) {
+            $this->pusher->trigger('wc-analytics', 'checkout', $event_data);
+        }
     }
     
     /**
@@ -132,6 +260,17 @@ class WC_Realtime_Tracker {
             exit;
         }
         
+        // Skip checkout events via AJAX as they're handled by page visit
+        if ($event_type === 'checkout') {
+            wp_send_json_success(array(
+                'event_id' => 0,
+                'event_type' => $event_type,
+                'timestamp' => current_time('mysql'),
+                'status' => 'skipped', // Checkout tracked by page visit
+            ));
+            exit;
+        }
+        
         // Get product ID and validate
         $product_id = isset($_POST['product_id']) ? absint($_POST['product_id']) : 0;
         
@@ -146,6 +285,31 @@ class WC_Realtime_Tracker {
         
         // Get IP address
         $ip_address = $this->get_client_ip();
+        
+        // For visitor events, check if this IP has already been counted today
+        if ($event_type === 'visitor') {
+            // Check if visitor with this IP has been recorded today
+            if ($this->has_visitor_been_recorded($ip_address)) {
+                wp_send_json_success(array(
+                    'event_id' => 0,
+                    'event_type' => $event_type,
+                    'timestamp' => current_time('mysql'),
+                    'status' => 'skipped', // Visitor already recorded
+                ));
+                exit;
+            }
+        }
+        
+        // Check for any duplicate event in the last 30 seconds
+        if ($this->is_duplicate_event($event_type, $ip_address, $product_id)) {
+            wp_send_json_success(array(
+                'event_id' => 0,
+                'event_type' => $event_type,
+                'timestamp' => current_time('mysql'),
+                'status' => 'skipped', // Event already recorded
+            ));
+            exit;
+        }
         
         // Get country information
         $geo_data = $this->geo->get_country_from_ip($ip_address);
@@ -170,6 +334,14 @@ class WC_Realtime_Tracker {
         
         // Send event via Pusher
         if ($event_id && $this->pusher->is_configured()) {
+            // Add product name for add_to_cart events
+            if ($event_type === 'add_to_cart' && $product_id > 0) {
+                $product = wc_get_product($product_id);
+                if ($product) {
+                    $event_data['product_name'] = html_entity_decode($product->get_name(), ENT_QUOTES, 'UTF-8');
+                }
+            }
+            
             $this->pusher->trigger('wc-analytics', $event_type, $event_data);
         }
         
@@ -178,6 +350,76 @@ class WC_Realtime_Tracker {
             'event_type' => $event_type,
             'timestamp' => current_time('mysql')
         ));
+    }
+    
+    /**
+     * Check if a visitor with this IP has already been recorded today
+     *
+     * @param string $ip_address Visitor IP address
+     * @return bool True if visitor already recorded, false otherwise
+     */
+    private function has_visitor_been_recorded($ip_address) {
+        global $wpdb;
+        
+        $today = date('Y-m-d');
+        $today_with_time = $today . ' 00:00:00';
+        
+        $table_name = $wpdb->prefix . 'wc_realtime_events';
+        
+        $result = $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM {$table_name} 
+            WHERE event_type = 'visitor' 
+            AND ip_address = %s 
+            AND created_at >= %s",
+            $ip_address,
+            $today_with_time
+        ));
+        
+        return (int)$result > 0;
+    }
+    
+    /**
+     * Check if an event might be a duplicate (recently recorded for same IP and product)
+     *
+     * @param string $event_type Event type
+     * @param string $ip_address IP address
+     * @param int $product_id Product ID
+     * @return bool True if likely duplicate, false otherwise
+     */
+    private function is_duplicate_event($event_type, $ip_address, $product_id) {
+        global $wpdb;
+        
+        $table_name = $wpdb->prefix . 'wc_realtime_events';
+        
+        // Look for events in the last 30 seconds (prevents double-clicks and page reloads)
+        $time_threshold = date('Y-m-d H:i:s', strtotime('-30 seconds'));
+        
+        // If no product ID, just check event type and IP
+        if ($product_id === 0) {
+            $result = $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM {$table_name} 
+                WHERE event_type = %s 
+                AND ip_address = %s 
+                AND created_at >= %s",
+                $event_type,
+                $ip_address,
+                $time_threshold
+            ));
+        } else {
+            $result = $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM {$table_name} 
+                WHERE event_type = %s 
+                AND ip_address = %s 
+                AND product_id = %d 
+                AND created_at >= %s",
+                $event_type,
+                $ip_address,
+                $product_id,
+                $time_threshold
+            ));
+        }
+        
+        return (int)$result > 0;
     }
     
     /**
@@ -199,6 +441,11 @@ class WC_Realtime_Tracker {
         
         // Get IP address
         $ip_address = $this->get_client_ip();
+        
+        // Check for duplicate event to prevent double tracking
+        if ($this->is_duplicate_event('add_to_cart', $ip_address, $product_id)) {
+            return;
+        }
         
         // Get country information
         $geo_data = $this->geo->get_country_from_ip($ip_address);
@@ -227,83 +474,6 @@ class WC_Realtime_Tracker {
             
             $this->pusher->trigger('wc-analytics', 'add_to_cart', $event_data);
         }
-    }
-    
-    /**
-     * Track "Checkout" event
-     */
-    public function track_checkout() {
-        if (!is_checkout()) {
-            return;
-        }
-        
-        // Check if already tracked in this session
-        if (isset($_COOKIE['wc_checkout_tracked']) && $_COOKIE['wc_checkout_tracked'] === 'yes') {
-            return;
-        }
-        
-        // Get IP address
-        $ip_address = $this->get_client_ip();
-        
-        // Get country information
-        $geo_data = $this->geo->get_country_from_ip($ip_address);
-        
-        // Get cart data
-        $cart = WC()->cart;
-        $items = array();
-        
-        if ($cart) {
-            foreach ($cart->get_cart() as $cart_item_key => $cart_item) {
-                $product = $cart_item['data'];
-                if ($product) {
-                    $items[] = array(
-                        'product_id' => $product->get_id(),
-                        'name' => html_entity_decode($product->get_name(), ENT_QUOTES, 'UTF-8'),
-                        'quantity' => $cart_item['quantity'],
-                        'price' => $product->get_price()
-                    );
-                }
-            }
-        }
-        
-        // Prepare event data
-        $event_data = array(
-            'session_id' => $this->get_or_create_session_id(),
-            'user_id' => get_current_user_id(),
-            'ip_address' => $ip_address,
-            'country_code' => isset($geo_data['country_code']) ? sanitize_text_field($geo_data['country_code']) : '',
-            'country_name' => isset($geo_data['country_name']) ? sanitize_text_field($geo_data['country_name']) : '',
-            'cart_total' => ($cart ? $cart->get_cart_contents_total() : 0),
-            'items' => $items
-        );
-        
-        // Track each product in the cart
-        if (!empty($items)) {
-            foreach ($items as $item) {
-                $product_event_data = array(
-                    'session_id' => $event_data['session_id'],
-                    'product_id' => absint($item['product_id']),
-                    'user_id' => $event_data['user_id'],
-                    'ip_address' => $event_data['ip_address'],
-                    'country_code' => $event_data['country_code'],
-                    'country_name' => $event_data['country_name']
-                );
-                
-                $this->db->save_event('checkout', $product_event_data);
-            }
-        }
-        
-        // Save general checkout event (without specific product)
-        $event_id = $this->db->save_event('checkout', $event_data);
-        
-        // Send event via Pusher
-        if ($event_id && $this->pusher->is_configured()) {
-            $this->pusher->trigger('wc-analytics', 'checkout', $event_data);
-        }
-        
-        // Set httponly cookie to prevent duplicate tracking
-        $secure = is_ssl();
-        setcookie('wc_checkout_tracked', 'yes', time() + 3600, COOKIEPATH, COOKIE_DOMAIN, $secure, true);
     }
     
     /**
@@ -406,6 +576,17 @@ class WC_Realtime_Tracker {
             $secure, 
             true  // HttpOnly flag
         );
+    }
+    
+    /**
+     * Check if current request is AJAX
+     *
+     * @return bool True if AJAX request
+     */
+    private function is_ajax_request() {
+        return (defined('DOING_AJAX') && DOING_AJAX) || 
+               (!empty($_SERVER['HTTP_X_REQUESTED_WITH']) && 
+                strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) == 'xmlhttprequest');
     }
     
     /**

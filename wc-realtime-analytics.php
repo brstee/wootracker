@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WooCommerce Real-time Analytics
  * Description: Real-time analytics for WooCommerce with visitor, add to cart, checkout, and purchase tracking.
- * Version: 1.0.0
+ * Version: 1.0.1
  * Author: IT Department
  * Text Domain: wc-realtime-analytics
  * Domain Path: /languages
@@ -17,7 +17,7 @@ if (!defined('ABSPATH')) {
 }
 
 // Define plugin constants
-define('WCRA_VERSION', '1.0.0');
+define('WCRA_VERSION', '1.0.1'); // Incrementing version for update recognition
 define('WCRA_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('WCRA_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('WCRA_BASENAME', plugin_basename(__FILE__));
@@ -149,6 +149,9 @@ function wcra_activate() {
         }
     }
     
+    // Set version option for upgrade checks
+    update_option('wc_realtime_analytics_version', WCRA_VERSION);
+    
     // Clear any cached data
     wcra_clear_cache();
     
@@ -156,6 +159,34 @@ function wcra_activate() {
     flush_rewrite_rules();
 }
 register_activation_hook(__FILE__, 'wcra_activate');
+
+// Run update checks on admin init
+function wcra_check_for_updates() {
+    if (!is_admin()) {
+        return;
+    }
+    
+    $current_version = get_option('wc_realtime_analytics_version', '1.0.0');
+    
+    // If current version is less than plugin version, run updates
+    if (version_compare($current_version, WCRA_VERSION, '<')) {
+        // Include database class
+        require_once WCRA_PLUGIN_DIR . 'includes/class-wc-realtime-db.php';
+        
+        // Initialize database handler
+        $db = new WC_Realtime_DB();
+        
+        // Ensure all tables exist, including the new visitors table
+        $db->create_tables();
+        
+        // Update version
+        update_option('wc_realtime_analytics_version', WCRA_VERSION);
+        
+        // Clear cache
+        wcra_clear_cache();
+    }
+}
+add_action('admin_init', 'wcra_check_for_updates');
 
 // Check plugin requirements
 function wcra_check_requirements() {
@@ -205,7 +236,8 @@ function wcra_uninstall() {
         'wc_realtime_pusher_app_id',
         'wc_realtime_pusher_key',
         'wc_realtime_pusher_secret',
-        'wc_realtime_pusher_cluster'
+        'wc_realtime_pusher_cluster',
+        'wc_realtime_analytics_version'
     );
     
     foreach ($options_to_delete as $option) {
@@ -228,7 +260,8 @@ function wcra_uninstall() {
     $tables = array(
         $wpdb->prefix . 'wc_realtime_events',
         $wpdb->prefix . 'wc_realtime_daily',
-        $wpdb->prefix . 'wc_realtime_products'
+        $wpdb->prefix . 'wc_realtime_products',
+        $wpdb->prefix . 'wc_realtime_visitors'
     );
     
     // Drop tables
@@ -276,3 +309,50 @@ function wcra_do_daily_cleanup() {
     wcra_clear_cache();
 }
 add_action('wcra_daily_cleanup', 'wcra_do_daily_cleanup');
+
+// Add reset data functionality for testing
+function wcra_reset_data() {
+    if (is_admin() && current_user_can('manage_options') && isset($_GET['wcra_reset']) && $_GET['wcra_reset'] === 'true') {
+        if (isset($_GET['wcra_nonce']) && wp_verify_nonce($_GET['wcra_nonce'], 'wcra_reset_data')) {
+            global $wpdb;
+            
+            // Get table names
+            $tables = array(
+                $wpdb->prefix . 'wc_realtime_events',
+                $wpdb->prefix . 'wc_realtime_daily',
+                $wpdb->prefix . 'wc_realtime_products',
+                $wpdb->prefix . 'wc_realtime_visitors'
+            );
+            
+            // Truncate each table
+            foreach ($tables as $table) {
+                $wpdb->query("TRUNCATE TABLE {$table}");
+            }
+            
+            // Clear cache
+            wcra_clear_cache();
+            
+            // Redirect to avoid refresh issues
+            wp_redirect(admin_url('admin.php?page=wc-realtime-analytics&reset=success'));
+            exit;
+        }
+    }
+    
+    // Show success message on dashboard
+    if (isset($_GET['reset']) && $_GET['reset'] === 'success') {
+        add_action('admin_notices', function() {
+            ?>
+            <div class="notice notice-success is-dismissible">
+                <p><?php esc_html_e('Analytics data has been reset successfully.', 'wc-realtime-analytics'); ?></p>
+            </div>
+            <?php
+        });
+    }
+}
+add_action('admin_init', 'wcra_reset_data');
+
+// Generate reset URL for testing
+function wcra_get_reset_url() {
+    $nonce = wp_create_nonce('wcra_reset_data');
+    return admin_url('admin.php?page=wc-realtime-analytics&wcra_reset=true&wcra_nonce=' . $nonce);
+}

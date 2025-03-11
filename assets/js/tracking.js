@@ -12,6 +12,12 @@
     let hasTrackedPageView = false;
     let attemptedTrackEvent = false;
     let trackingInProgress = false;
+    let trackedEvents = {
+        visitor: false,
+        add_to_cart: {},
+        checkout: false,
+        purchase: false
+    };
     
     // Initialize tracking
     const initTracking = function() {
@@ -37,7 +43,7 @@
             }
         }
         
-        // Track initial page view
+        // Track initial page view (only once per session)
         trackPageView();
         
         // Set up event listeners
@@ -46,7 +52,7 @@
     
     // Track page view
     const trackPageView = function() {
-        if (hasTrackedPageView || trackingInProgress) {
+        if (hasTrackedPageView || trackingInProgress || trackedEvents.visitor) {
             return;
         }
         
@@ -72,6 +78,11 @@
             success: function(response) {
                 hasTrackedPageView = true;
                 trackingInProgress = false;
+                
+                // Mark visitor as tracked
+                if (response.success) {
+                    trackedEvents.visitor = true;
+                }
             },
             error: function(xhr, status, error) {
                 console.error('WC Realtime Analytics: Error tracking page view', status, error);
@@ -88,10 +99,17 @@
     
     // Set up event listeners for user actions
     const setupEventListeners = function() {
-        // Track add to cart button clicks
+        // Track add to cart button clicks with a flag to avoid double tracking
+        let addToCartInProgress = false;
+        
         $(document.body).on('click', '.add_to_cart_button, .single_add_to_cart_button', function(e) {
-            // We don't need to track this event via JS since it will be tracked server-side
-            // This is just a backup in case server-side tracking fails
+            // Ngăn chặn tracking trùng lặp
+            if (addToCartInProgress) {
+                return;
+            }
+            
+            addToCartInProgress = true;
+            setTimeout(function() { addToCartInProgress = false; }, 2000); // reset flag after 2 seconds
             
             const $button = $(this);
             let productId = $button.data('product_id');
@@ -109,82 +127,97 @@
                 productId = parseInt(productId, 10);
                 
                 if (productId > 0) {
-                    // Delay tracking to allow WooCommerce's own handlers to fire first
-                    setTimeout(function() {
-                        trackEvent('add_to_cart', productId);
-                    }, 500);
-                }
-            }
-        });
-        
-        // Track checkout button clicks
-        $(document.body).on('click', '.checkout-button, .wc-proceed-to-checkout a', function(e) {
-            // Just a backup for the server-side tracking
-            trackEvent('checkout', 0);
-        });
-        
-        // Track events from WooCommerce's AJAX handlers
-        $(document.body).on('added_to_cart', function(event, fragments, cart_hash, $button) {
-            // This event is triggered by WooCommerce after an item is added to the cart
-            if ($button && $button.data('product_id')) {
-                const productId = parseInt($button.data('product_id'), 10);
-                if (productId > 0) {
-                    trackEvent('add_to_cart', productId);
-                }
-            }
-        });
-    };
-    
-    // Generic event tracker
-    const trackEvent = function(eventType, productId) {
-        if (trackingInProgress) {
-            return;
-        }
-        
-        trackingInProgress = true;
-        
-        // Validate event type
-        const validEvents = ['visitor', 'add_to_cart', 'checkout', 'purchase'];
-        if (validEvents.indexOf(eventType) === -1) {
-            console.error('WC Realtime Analytics: Invalid event type', eventType);
-            trackingInProgress = false;
-            return;
-        }
-        
-        // Ensure product ID is an integer
-        if (productId) {
-            productId = parseInt(productId, 10);
-        } else {
-            productId = 0;
-        }
-        
-        const data = {
-            action: 'wc_realtime_track',
-            nonce: wcRealtimeConfig.nonce,
-            event_type: eventType,
-            session_id: wcRealtimeConfig.session_id,
-            product_id: productId
-        };
-        
-        $.ajax({
-            url: wcRealtimeConfig.ajax_url,
-            type: 'POST',
-            data: data,
-            dataType: 'json',
-            success: function(response) {
-                trackingInProgress = false;
-            },
-            error: function(xhr, status, error) {
-                console.error('WC Realtime Analytics: Error tracking event', eventType, status, error);
-                trackingInProgress = false;
-            }
-        });
-    };
-    
-    // Initialize when document is ready
-    $(document).ready(function() {
-        // Delay initialization slightly to ensure page is fully loaded
-        setTimeout(initTracking, 100);
-    });
-    
+ // Check if this product has already been tracked in this session
+ if (trackedEvents.add_to_cart[productId]) {
+    addToCartInProgress = false;
+    return;
+}
+
+// Handle tracking immediately for AJAX add to cart
+trackEvent('add_to_cart', productId);
+}
+}
+});
+
+// Add a handler for WooCommerce AJAX complete to prevent duplicate tracking
+$(document).ajaxComplete(function(event, xhr, settings) {
+if (settings.url && settings.url.indexOf('wc-ajax=add_to_cart') > -1) {
+// This is handled by our click handler already
+addToCartInProgress = false;
+}
+});
+};
+
+// Generic event tracker
+const trackEvent = function(eventType, productId) {
+if (trackingInProgress) {
+return;
+}
+
+// Check if this event has already been tracked
+if (eventType === 'checkout' && trackedEvents.checkout) {
+return;
+} else if (eventType === 'purchase' && trackedEvents.purchase) {
+return;
+} else if (eventType === 'add_to_cart' && productId > 0 && trackedEvents.add_to_cart[productId]) {
+return;
+}
+
+trackingInProgress = true;
+
+// Validate event type
+const validEvents = ['visitor', 'add_to_cart', 'checkout', 'purchase'];
+if (validEvents.indexOf(eventType) === -1) {
+console.error('WC Realtime Analytics: Invalid event type', eventType);
+trackingInProgress = false;
+return;
+}
+
+// Ensure product ID is an integer
+if (productId) {
+productId = parseInt(productId, 10);
+} else {
+productId = 0;
+}
+
+const data = {
+action: 'wc_realtime_track',
+nonce: wcRealtimeConfig.nonce,
+event_type: eventType,
+session_id: wcRealtimeConfig.session_id,
+product_id: productId
+};
+
+$.ajax({
+url: wcRealtimeConfig.ajax_url,
+type: 'POST',
+data: data,
+dataType: 'json',
+success: function(response) {
+trackingInProgress = false;
+
+// Mark as tracked if successful
+if (response.success) {
+if (eventType === 'checkout') {
+    trackedEvents.checkout = true;
+} else if (eventType === 'purchase') {
+    trackedEvents.purchase = true;
+} else if (eventType === 'add_to_cart' && productId > 0) {
+    trackedEvents.add_to_cart[productId] = true;
+}
+}
+},
+error: function(xhr, status, error) {
+console.error('WC Realtime Analytics: Error tracking event', eventType, status, error);
+trackingInProgress = false;
+}
+});
+};
+
+// Initialize when document is ready
+$(document).ready(function() {
+// Delay initialization slightly to ensure page is fully loaded
+setTimeout(initTracking, 100);
+});
+
 })(jQuery);

@@ -17,6 +17,7 @@ class WC_Realtime_DB {
     private $table_events;
     private $table_daily;
     private $table_products;
+    private $table_visitors;
     
     /**
      * Constructor
@@ -28,6 +29,7 @@ class WC_Realtime_DB {
         $this->table_events = $wpdb->prefix . 'wc_realtime_events';
         $this->table_daily = $wpdb->prefix . 'wc_realtime_daily';
         $this->table_products = $wpdb->prefix . 'wc_realtime_products';
+        $this->table_visitors = $wpdb->prefix . 'wc_realtime_visitors';
     }
     
     /**
@@ -91,10 +93,78 @@ class WC_Realtime_DB {
             KEY product_id (product_id)
         ) $charset_collate;";
         
+        // Table for tracking unique visitors by IP
+        $sql_visitors = "CREATE TABLE {$this->table_visitors} (
+            id bigint(20) NOT NULL AUTO_INCREMENT,
+            date date NOT NULL,
+            ip_address varchar(100) NOT NULL,
+            country_code varchar(2) DEFAULT '',
+            country_name varchar(50) DEFAULT '',
+            created_at datetime DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY  (id),
+            UNIQUE KEY date_ip (date, ip_address),
+            KEY date (date)
+        ) $charset_collate;";
+        
         // Execute table creation queries
         dbDelta($sql_events);
         dbDelta($sql_daily);
         dbDelta($sql_products);
+        dbDelta($sql_visitors);
+    }
+    
+    /**
+     * Check if tables exist
+     *
+     * @return bool True if all required tables exist
+     */
+    public function tables_exist() {
+        global $wpdb;
+        
+        $required_tables = array(
+            $this->table_events,
+            $this->table_daily,
+            $this->table_products
+        );
+        
+        foreach ($required_tables as $table) {
+            $table_exists = $wpdb->get_var($wpdb->prepare(
+                "SHOW TABLES LIKE %s",
+                $table
+            )) === $table;
+            
+            if (!$table_exists) {
+                return false;
+            }
+        }
+        
+        // Check if visitors table exists, create it if not
+        $visitors_table_exists = $wpdb->get_var($wpdb->prepare(
+            "SHOW TABLES LIKE %s",
+            $this->table_visitors
+        )) === $this->table_visitors;
+        
+        if (!$visitors_table_exists) {
+            require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
+            
+            $charset_collate = $wpdb->get_charset_collate();
+            
+            $sql_visitors = "CREATE TABLE {$this->table_visitors} (
+                id bigint(20) NOT NULL AUTO_INCREMENT,
+                date date NOT NULL,
+                ip_address varchar(100) NOT NULL,
+                country_code varchar(2) DEFAULT '',
+                country_name varchar(50) DEFAULT '',
+                created_at datetime DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY  (id),
+                UNIQUE KEY date_ip (date, ip_address),
+                KEY date (date)
+            ) $charset_collate;";
+            
+            dbDelta($sql_visitors);
+        }
+        
+        return true;
     }
     
     /**
@@ -132,6 +202,7 @@ class WC_Realtime_DB {
         $country_code = substr($country_code, 0, 2);
         $country_name = substr($country_name, 0, 50);
         
+        // Insert event record
         $result = $wpdb->insert(
             $this->table_events,
             array(
@@ -147,13 +218,110 @@ class WC_Realtime_DB {
             array('%s', '%s', '%d', '%d', '%s', '%s', '%s', '%s')
         );
         
+        if (!$result) {
+            return false;
+        }
+        
+        $event_id = $wpdb->insert_id;
+        
+        // Handle visitor events differently - track unique IP addresses
+        if ($event_type === 'visitor') {
+            $this->track_unique_visitor($ip_address, $country_code, $country_name);
+        }
+        
+        // Update today's stats
+        $this->update_today_stats($event_type, $product_id, $country_code, $country_name);
+        
+        return $event_id;
+    }
+    
+    /**
+     * Track unique visitor by IP address
+     *
+     * @param string $ip_address Visitor IP address
+     * @param string $country_code Country code
+     * @param string $country_name Country name
+     * @return bool True if new visitor, false if already recorded
+     */
+    private function track_unique_visitor($ip_address, $country_code, $country_name) {
+        global $wpdb;
+        
+        $today = date('Y-m-d');
+        
+        // Check if this IP is already recorded for today
+        $exists = $wpdb->get_var($wpdb->prepare(
+            "SELECT id FROM {$this->table_visitors} 
+            WHERE date = %s AND ip_address = %s",
+            $today,
+            $ip_address
+        ));
+        
+        if ($exists) {
+            return false; // Already recorded
+        }
+        
+        // Insert new visitor record
+        $result = $wpdb->insert(
+            $this->table_visitors,
+            array(
+                'date' => $today,
+                'ip_address' => $ip_address,
+                'country_code' => $country_code,
+                'country_name' => $country_name,
+                'created_at' => current_time('mysql')
+            ),
+            array('%s', '%s', '%s', '%s', '%s')
+        );
+        
+        // Increment unique visitor count in daily stats
         if ($result) {
-            // Update today's stats
-            $this->update_today_stats($event_type, $product_id, $country_code, $country_name);
-            return $wpdb->insert_id;
+            $this->increment_unique_visitor($today, $country_code, $country_name);
+            return true;
         }
         
         return false;
+    }
+    
+    /**
+     * Increment unique visitor count in daily stats
+     *
+     * @param string $date Date (Y-m-d)
+     * @param string $country_code Country code
+     * @param string $country_name Country name
+     */
+    private function increment_unique_visitor($date, $country_code, $country_name) {
+        global $wpdb;
+        
+        // Check if record exists for this date and country
+        $exists = $wpdb->get_var($wpdb->prepare(
+            "SELECT id FROM {$this->table_daily} 
+            WHERE date = %s AND country_code = %s",
+            $date,
+            $country_code
+        ));
+        
+        if (!$exists) {
+            // Create new record
+            $wpdb->insert(
+                $this->table_daily,
+                array(
+                    'date' => $date,
+                    'country_code' => $country_code,
+                    'country_name' => $country_name,
+                    'visitors' => 1
+                ),
+                array('%s', '%s', '%s', '%d')
+            );
+        } else {
+            // Update existing record
+            $wpdb->query($wpdb->prepare(
+                "UPDATE {$this->table_daily} 
+                SET visitors = visitors + 1 
+                WHERE date = %s AND country_code = %s",
+                $date,
+                $country_code
+            ));
+        }
     }
     
     /**
@@ -167,7 +335,16 @@ class WC_Realtime_DB {
     private function update_today_stats($event_type, $product_id, $country_code, $country_name) {
         $today = date('Y-m-d');
         
-        // Update daily stats
+        // Skip visitor events as they're handled separately
+        if ($event_type === 'visitor') {
+            // Update product-specific visitor stats if product ID is provided
+            if ($product_id > 0) {
+                $this->update_product_stats($event_type, $today, $product_id, $country_code, $country_name);
+            }
+            return;
+        }
+        
+        // Update daily stats for non-visitor events
         $this->update_daily_stats($event_type, $today, $country_code, $country_name);
         
         // If we have a product_id, update product stats
@@ -190,6 +367,11 @@ class WC_Realtime_DB {
         // Validate parameters
         $field = $this->get_field_from_event_type($event_type);
         if (!$field) {
+            return;
+        }
+        
+        // Skip visitor events as they're handled separately
+        if ($field === 'visitors') {
             return;
         }
         
@@ -216,17 +398,18 @@ class WC_Realtime_DB {
                 array(
                     'date' => $date,
                     'country_code' => $country_code,
-                    'country_name' => $country_name
+                    'country_name' => $country_name,
+                    $field => 1
                 ),
-                array('%s', '%s', '%s')
+                array('%s', '%s', '%s', '%d')
             );
+        } else {
+            // Update stats based on event type using prepared statement
+            $wpdb->query($wpdb->prepare(
+                "UPDATE {$this->table_daily} SET {$field} = {$field} + 1 WHERE date = %s AND country_code = %s",
+                $date, $country_code
+            ));
         }
-        
-        // Update stats based on event type using prepared statement
-        $wpdb->query($wpdb->prepare(
-            "UPDATE {$this->table_daily} SET {$field} = {$field} + 1 WHERE date = %s AND country_code = %s",
-            $date, $country_code
-        ));
     }
     
     /**
@@ -277,18 +460,19 @@ class WC_Realtime_DB {
                     'date' => $date,
                     'product_id' => $product_id,
                     'country_code' => $country_code,
-                    'country_name' => $country_name
+                    'country_name' => $country_name,
+                    $field => 1
                 ),
-                array('%s', '%d', '%s', '%s')
+                array('%s', '%d', '%s', '%s', '%d')
             );
+        } else {
+            // Update stats based on event type using prepared statement
+            $wpdb->query($wpdb->prepare(
+                "UPDATE {$this->table_products} SET {$field} = {$field} + 1 
+                WHERE date = %s AND product_id = %d AND country_code = %s",
+                $date, $product_id, $country_code
+            ));
         }
-        
-        // Update stats based on event type using prepared statement
-        $wpdb->query($wpdb->prepare(
-            "UPDATE {$this->table_products} SET {$field} = {$field} + 1 
-            WHERE date = %s AND product_id = %d AND country_code = %s",
-            $date, $product_id, $country_code
-        ));
     }
     
     /**
@@ -416,6 +600,25 @@ class WC_Realtime_DB {
             'products' => $product_stats,
             'countries' => $country_stats
         );
+    }
+    
+    /**
+     * Get total unique visitors for a date range
+     *
+     * @param string $start_date Start date (Y-m-d)
+     * @param string $end_date End date (Y-m-d)
+     * @return int Count of unique visitors
+     */
+    public function get_unique_visitors($start_date, $end_date) {
+        global $wpdb;
+        
+        $count = $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM {$this->table_visitors} 
+            WHERE date BETWEEN %s AND %s",
+            $start_date, $end_date
+        ));
+        
+        return absint($count);
     }
     
     /**
@@ -555,37 +758,20 @@ class WC_Realtime_DB {
         
         $date_limit = date('Y-m-d H:i:s', strtotime("-{$days_to_keep} days"));
         
-        $deleted = $wpdb->query($wpdb->prepare(
+        // Delete old events
+        $deleted_events = $wpdb->query($wpdb->prepare(
             "DELETE FROM {$this->table_events} WHERE created_at < %s",
             $date_limit
         ));
         
-        return $deleted;
-    }
-    
-    /**
-     * Check if database tables exist
-     * 
-     * @return bool True if all tables exist
-     */
-    public function tables_exist() {
-        global $wpdb;
+        // Delete old visitor records
+        $date_limit_day = date('Y-m-d', strtotime("-{$days_to_keep} days"));
         
-        $events_table_exists = $wpdb->get_var($wpdb->prepare(
-            "SHOW TABLES LIKE %s",
-            $this->table_events
-        )) === $this->table_events;
+        $deleted_visitors = $wpdb->query($wpdb->prepare(
+            "DELETE FROM {$this->table_visitors} WHERE date < %s",
+            $date_limit_day
+        ));
         
-        $daily_table_exists = $wpdb->get_var($wpdb->prepare(
-            "SHOW TABLES LIKE %s",
-            $this->table_daily
-        )) === $this->table_daily;
-        
-        $products_table_exists = $wpdb->get_var($wpdb->prepare(
-            "SHOW TABLES LIKE %s",
-            $this->table_products
-        )) === $this->table_products;
-        
-        return $events_table_exists && $daily_table_exists && $products_table_exists;
+        return $deleted_events + $deleted_visitors;
     }
 }

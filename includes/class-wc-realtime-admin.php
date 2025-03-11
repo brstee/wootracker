@@ -396,6 +396,17 @@ class WC_Realtime_Admin {
                     </div>
                 </div>
             </div>
+<?php if (current_user_can('manage_options')): ?>
+    <div class="wc-realtime-reset-section" style="margin-top: 30px; border-top: 1px solid #ddd; padding-top: 20px;">
+        <h2><?php _e('Reset Analytics Data', 'wc-realtime-analytics'); ?></h2>
+        <p><?php _e('Use this button to reset all analytics data for testing purposes. This cannot be undone!', 'wc-realtime-analytics'); ?></p>
+        <?php
+        $nonce = wp_create_nonce('wcra_reset_data');
+        $reset_url = admin_url('admin.php?page=wc-realtime-analytics&wcra_reset=true&wcra_nonce=' . $nonce);
+        ?>
+        <a href="<?php echo esc_url($reset_url); ?>" class="button button-secondary" onclick="return confirm('<?php esc_attr_e('Are you sure you want to reset all analytics data? This action cannot be undone!', 'wc-realtime-analytics'); ?>');"><?php _e('Reset All Data', 'wc-realtime-analytics'); ?></a>
+    </div>
+<?php endif; ?>
         </div>
         <?php
     }
