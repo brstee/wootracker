@@ -107,6 +107,18 @@ class WC_Realtime_Tracker {
         // Generate a nonce specifically for tracking
         $tracking_nonce = wp_create_nonce('wc_realtime_tracking_nonce');
         
+        // Get current product information if on a product page
+        $product_id = 0;
+        $product_name = '';
+        
+        if (is_product()) {
+            global $product;
+            if ($product && method_exists($product, 'get_id')) {
+                $product_id = $product->get_id();
+                $product_name = html_entity_decode($product->get_name(), ENT_QUOTES, 'UTF-8');
+            }
+        }
+        
         // Pass configuration to JavaScript
         wp_localize_script(
             'wc-realtime-tracking',
@@ -117,7 +129,8 @@ class WC_Realtime_Tracker {
                 'pusher_key' => $this->pusher->get_key(),
                 'pusher_cluster' => $this->pusher->get_cluster(),
                 'is_product' => is_product(),
-                'product_id' => $this->get_current_product_id(),
+                'product_id' => $product_id,
+                'product_name' => $product_name,
                 'session_id' => $this->get_or_create_session_id(),
                 'is_checkout' => is_checkout()
             )
@@ -217,7 +230,8 @@ class WC_Realtime_Tracker {
             'country_code' => isset($geo_data['country_code']) ? sanitize_text_field($geo_data['country_code']) : '',
             'country_name' => isset($geo_data['country_name']) ? sanitize_text_field($geo_data['country_name']) : '',
             'cart_total' => ($cart ? $cart->get_cart_contents_total() : 0),
-            'items' => $items
+            'items' => $items,
+            'items_count' => count($items)
         );
         
         // First save general checkout event (without specific product)
@@ -230,9 +244,6 @@ class WC_Realtime_Tracker {
         // Set httponly cookie to prevent duplicate tracking - use session ID as value
         $secure = is_ssl();
         setcookie($cookie_name, $session_id, time() + 3600, COOKIEPATH, COOKIE_DOMAIN, $secure, true);
-        
-        // Only track products if primary event succeeded - but we don't need per-product checkout events
-        // Removed to prevent multiple entries for a single checkout
         
         // Send event via Pusher
         if ($this->pusher->is_configured()) {
@@ -274,10 +285,18 @@ class WC_Realtime_Tracker {
         // Get product ID and validate
         $product_id = isset($_POST['product_id']) ? absint($_POST['product_id']) : 0;
         
+        // Get product name if provided
+        $product_name = isset($_POST['product_name']) ? sanitize_text_field($_POST['product_name']) : '';
+        
         // Validate product ID if provided
-        if ($product_id > 0 && !wc_get_product($product_id)) {
-            wp_send_json_error(array('message' => 'Invalid product ID'), 400);
-            exit;
+        if ($product_id > 0 && !$product_name) {
+            $product = wc_get_product($product_id);
+            if ($product) {
+                $product_name = html_entity_decode($product->get_name(), ENT_QUOTES, 'UTF-8');
+            } else {
+                wp_send_json_error(array('message' => 'Invalid product ID'), 400);
+                exit;
+            }
         }
         
         // Get session ID
@@ -314,14 +333,19 @@ class WC_Realtime_Tracker {
         // Get country information
         $geo_data = $this->geo->get_country_from_ip($ip_address);
         
+        // Get quantity for add to cart events
+        $quantity = isset($_POST['quantity']) ? absint($_POST['quantity']) : 1;
+        
         // Prepare event data
         $event_data = array(
             'session_id' => $session_id,
             'product_id' => $product_id,
+            'product_name' => $product_name,
             'user_id' => get_current_user_id(),
             'ip_address' => $ip_address,
             'country_code' => isset($geo_data['country_code']) ? sanitize_text_field($geo_data['country_code']) : '',
-            'country_name' => isset($geo_data['country_name']) ? sanitize_text_field($geo_data['country_name']) : ''
+            'country_name' => isset($geo_data['country_name']) ? sanitize_text_field($geo_data['country_name']) : '',
+            'quantity' => $quantity
         );
         
         // Save event to database
@@ -334,14 +358,6 @@ class WC_Realtime_Tracker {
         
         // Send event via Pusher
         if ($event_id && $this->pusher->is_configured()) {
-            // Add product name for add_to_cart events
-            if ($event_type === 'add_to_cart' && $product_id > 0) {
-                $product = wc_get_product($product_id);
-                if ($product) {
-                    $event_data['product_name'] = html_entity_decode($product->get_name(), ENT_QUOTES, 'UTF-8');
-                }
-            }
-            
             $this->pusher->trigger('wc-analytics', $event_type, $event_data);
         }
         
@@ -461,17 +477,17 @@ class WC_Realtime_Tracker {
             'quantity' => absint($quantity)
         );
         
+        // Add product name for dashboard display
+        $product = wc_get_product($product_id);
+        if ($product) {
+            $event_data['product_name'] = html_entity_decode($product->get_name(), ENT_QUOTES, 'UTF-8');
+        }
+        
         // Save event to database
         $event_id = $this->db->save_event('add_to_cart', $event_data);
         
         // Send event via Pusher
         if ($event_id && $this->pusher->is_configured()) {
-            // Add product name for dashboard display
-            $product = wc_get_product($product_id);
-            if ($product) {
-                $event_data['product_name'] = html_entity_decode($product->get_name(), ENT_QUOTES, 'UTF-8');
-            }
-            
             $this->pusher->trigger('wc-analytics', 'add_to_cart', $event_data);
         }
     }
@@ -535,7 +551,8 @@ class WC_Realtime_Tracker {
             'country_name' => isset($geo_data['country_name']) ? sanitize_text_field($geo_data['country_name']) : '',
             'order_id' => $order_id,
             'order_total' => $order->get_total(),
-            'items' => $items
+            'items' => $items,
+            'items_count' => count($items)
         );
         
         // Track each product in the order
@@ -544,10 +561,14 @@ class WC_Realtime_Tracker {
                 $product_event_data = array(
                     'session_id' => $event_data['session_id'],
                     'product_id' => absint($item['product_id']),
+                    'product_name' => $item['name'],
                     'user_id' => $event_data['user_id'],
                     'ip_address' => $event_data['ip_address'],
                     'country_code' => $event_data['country_code'],
-                    'country_name' => $event_data['country_name']
+                    'country_name' => $event_data['country_name'],
+                    'quantity' => $item['quantity'],
+                    'price' => $item['price'],
+                    'order_id' => $order_id
                 );
                 
                 $this->db->save_event('purchase', $product_event_data);

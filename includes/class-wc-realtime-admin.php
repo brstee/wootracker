@@ -63,6 +63,12 @@ class WC_Realtime_Admin {
         
         // AJAX handlers for dashboard data
         add_action('wp_ajax_wc_realtime_get_stats', array($this, 'ajax_get_stats'));
+        
+        // Add AJAX handler for test event
+        add_action('wp_ajax_wc_realtime_test_event', array($this, 'ajax_test_event'));
+        
+        // Add a debug action for testing Pusher when on main plugin page
+        add_action('admin_footer', array($this, 'add_debug_footer'));
     }
     
     /**
@@ -206,7 +212,7 @@ class WC_Realtime_Admin {
             'wc-realtime-admin',
             WCRA_PLUGIN_URL . 'assets/js/dashboard.js',
             array('jquery', 'pusher-js', 'chartjs', 'jquery-ui-datepicker'),
-            WCRA_VERSION,
+            WCRA_VERSION . '.' . time(), // Add timestamp to bust cache during development
             true
         );
         
@@ -227,6 +233,27 @@ class WC_Realtime_Admin {
             WCRA_VERSION
         );
         
+        // Get store currency format
+        $currency_format = html_entity_decode(
+            get_woocommerce_currency_symbol(),
+            ENT_QUOTES,
+            'UTF-8'
+        ) . '%s';
+        
+        if (function_exists('get_woocommerce_price_format')) {
+            $currency_format = get_woocommerce_price_format();
+        }
+        
+        // Test connection to Pusher
+        $pusher_connection_status = false;
+        if ($this->pusher->is_configured()) {
+            $pusher_connection_status = $this->pusher->test_connection();
+            error_log('WC Realtime Analytics: Pusher connection test result: ' . ($pusher_connection_status ? 'success' : 'failure'));
+        }
+        
+        // Get last events for prefilling the Live Events container
+        $last_events = $this->get_last_events(10);
+        
         // Pass data to JavaScript
         wp_localize_script('wc-realtime-admin', 'wcRealtimeAdmin', array(
             'ajax_url' => admin_url('admin-ajax.php'),
@@ -234,6 +261,10 @@ class WC_Realtime_Admin {
             'pusher_key' => $this->pusher->get_key(),
             'pusher_cluster' => $this->pusher->get_cluster(),
             'is_pusher_configured' => $this->pusher->is_configured(),
+            'pusher_connection_status' => $pusher_connection_status,
+            'currency_format' => $currency_format,
+            'last_events' => $last_events,
+            'current_version' => WCRA_VERSION,
             'locale' => array(
                 'loading' => __('Loading...', 'wc-realtime-analytics'),
                 'visitors' => __('Visitors', 'wc-realtime-analytics'),
@@ -247,9 +278,126 @@ class WC_Realtime_Admin {
                 'country' => __('Country', 'wc-realtime-analytics'),
                 'no_data' => __('No data available for this period', 'wc-realtime-analytics'),
                 'error' => __('An error occurred', 'wc-realtime-analytics'),
+                'connection_error' => __('Error connecting to real-time service', 'wc-realtime-analytics'),
+                'connecting' => __('Connecting to real-time service...', 'wc-realtime-analytics'),
+                'connected' => __('Connected! Waiting for events...', 'wc-realtime-analytics'),
                 'conversion_funnel' => __('Conversion Funnel', 'wc-realtime-analytics'),
+                'error_missing_dates' => __('Please select both start and end dates', 'wc-realtime-analytics'),
+                'error_invalid_date_format' => __('Invalid date format. Please use YYYY-MM-DD', 'wc-realtime-analytics'),
+                'error_date_range' => __('Start date must be before end date', 'wc-realtime-analytics'),
+                'test_event_sent' => __('Test event sent', 'wc-realtime-analytics'),
+                'test_event_failed' => __('Failed to send test event', 'wc-realtime-analytics')
             )
         ));
+    }
+    
+    /**
+     * Get last events for Live Events section
+     *
+     * @param int $count Number of events to retrieve
+     * @return array Last events
+     */
+    private function get_last_events($count = 10) {
+        global $wpdb;
+        
+        $table_name = $wpdb->prefix . 'wc_realtime_events';
+        
+        $results = $wpdb->get_results($wpdb->prepare(
+            "SELECT * FROM {$table_name} 
+            ORDER BY created_at DESC 
+            LIMIT %d",
+            (int)$count
+        ), ARRAY_A);
+        
+        $events = array();
+        
+        if (!empty($results)) {
+            foreach ($results as $row) {
+                // Get product name if needed
+                $product_name = '';
+                if (!empty($row['product_id'])) {
+                    $product = wc_get_product($row['product_id']);
+                    if ($product) {
+                        $product_name = html_entity_decode($product->get_name(), ENT_QUOTES, 'UTF-8');
+                    }
+                }
+                
+                // Format event data
+                $events[] = array(
+                    'event_type' => $row['event_type'],
+                    'product_id' => (int)$row['product_id'],
+                    'product_name' => $product_name,
+                    'country_code' => $row['country_code'],
+                    'country_name' => $row['country_name'],
+                    'created_at' => $row['created_at']
+                );
+            }
+        }
+        
+        return $events;
+    }
+    
+    /**
+     * Add debug footer to admin page
+     */
+    public function add_debug_footer() {
+        $screen = get_current_screen();
+        
+        // Only on main plugin page and when user can manage options
+        if ($screen->id !== 'toplevel_page_wc-realtime-analytics' || !current_user_can('manage_options')) {
+            return;
+        }
+        
+        // Add a simple test button and debug output
+        ?>
+        <script>
+        jQuery(document).ready(function($) {
+            // Add a hidden debug section to the bottom of the page
+            $('<div id="wcra-debug-section" style="margin-top: 30px; padding: 20px; border-top: 1px solid #ddd;">' +
+                '<h3>Debug Tools</h3>' +
+                '<p>Use these tools to test the real-time connection:</p>' +
+                '<button id="wcra-test-event" class="button">Send Test Event</button> ' +
+                '<span id="wcra-test-result" style="margin-left: 10px;"></span>' +
+                '<div id="wcra-debug-output" style="margin-top: 10px; padding: 10px; background: #f8f8f8; height: 100px; overflow: auto; display: none;"></div>' +
+            '</div>').appendTo('.wc-realtime-analytics-wrap');
+            
+            // Test event button
+            $('#wcra-test-event').on('click', function() {
+                $('#wcra-test-result').text('Sending...');
+                
+                $.ajax({
+                    url: wcRealtimeAdmin.ajax_url,
+                    type: 'POST',
+                    data: {
+                        action: 'wc_realtime_test_event',
+                        nonce: wcRealtimeAdmin.nonce
+                    },
+                    success: function(response) {
+                        if (response.success) {
+                            $('#wcra-test-result').text(wcRealtimeAdmin.locale.test_event_sent || 'Test event sent')
+                                .css('color', 'green');
+                        } else {
+                            $('#wcra-test-result').text((response.data && response.data.message) || 
+                                wcRealtimeAdmin.locale.test_event_failed || 'Failed to send test event')
+                                .css('color', 'red');
+                        }
+                    },
+                    error: function() {
+                        $('#wcra-test-result').text(wcRealtimeAdmin.locale.test_event_failed || 'Failed to send test event')
+                            .css('color', 'red');
+                    }
+                });
+            });
+            
+            // Show debug output if shift+d is pressed
+            $(document).keydown(function(e) {
+                if (e.shiftKey && e.key === 'D') {
+                    $('#wcra-debug-section').toggle();
+                }
+            });
+        });
+        </script>
+        <?php
     }
     
     /**
@@ -481,145 +629,191 @@ class WC_Realtime_Admin {
                                 <option value="ap1" <?php selected(get_option('wc_realtime_pusher_cluster'), 'ap1'); ?>>ap1 (Asia Pacific)</option>
                                 <option value="ap2" <?php selected(get_option('wc_realtime_pusher_cluster'), 'ap2'); ?>>ap2 (Asia Pacific)</option>
                                 <option value="ap3" <?php selected(get_option('wc_realtime_pusher_cluster'), 'ap3'); ?>>ap3 (Asia Pacific)</option>
-                                <option value="ap4" <?php selected(get_option('wc_realtime_pusher_cluster'), 'ap4'); ?>>ap4 (Asia Pacific)</option>
-                            </select>
-                        </td>
-                    </tr>
-                </table>
-                
-                <p class="submit">
-                    <input type="submit" name="wc_realtime_save_settings" class="button-primary" value="<?php esc_attr_e('Save Settings', 'wc-realtime-analytics'); ?>" />
-                </p>
-            </form>
-            
-            <hr>
-            
-            <h2><?php _e('Setup Instructions', 'wc-realtime-analytics'); ?></h2>
-            <ol>
-                <li><?php printf(
-                    esc_html__('Create a free account at %s', 'wc-realtime-analytics'),
-                    '<a href="https://pusher.com/" target="_blank">Pusher.com</a>'
-                ); ?></li>
-                <li><?php esc_html_e('Create a new Channels app in your Pusher dashboard', 'wc-realtime-analytics'); ?></li>
-                <li><?php esc_html_e('Copy the App ID, Key, and Secret from your Pusher app', 'wc-realtime-analytics'); ?></li>
-                <li><?php esc_html_e('Select the appropriate cluster for your region', 'wc-realtime-analytics'); ?></li>
-                <li><?php esc_html_e('Enter these details above and save the settings', 'wc-realtime-analytics'); ?></li>
-            </ol>
-            
-            <p><?php esc_html_e('Once configured, real-time analytics will begin tracking automatically.', 'wc-realtime-analytics'); ?></p>
-        </div>
-        <?php
-    }
-    
-    /**
-     * AJAX handler to get statistics
-     */
-    public function ajax_get_stats() {
-        // Verify nonce
-        if (!isset($_POST['nonce']) || !wp_verify_nonce(sanitize_text_field($_POST['nonce']), 'wc_realtime_admin_nonce')) {
-            wp_send_json_error(array(
-                'message' => __('Security check failed', 'wc-realtime-analytics')
-            ), 403);
-            exit;
-        }
-        
-        // Check capability
-        if (!current_user_can('manage_woocommerce')) {
-            wp_send_json_error(array(
-                'message' => __('Permission denied', 'wc-realtime-analytics')
-            ), 403);
-            exit;
-        }
-        
-        // Get timeframe parameter
-        $timeframe = isset($_POST['timeframe']) ? sanitize_text_field($_POST['timeframe']) : 'today';
-        
-        // Validate timeframe
-        $valid_timeframes = array(
-            'today', 'yesterday', 'this_week', 'this_month', 
-            'last_7_days', 'last_30_days', 'custom'
-        );
-        
-        if (!in_array($timeframe, $valid_timeframes, true)) {
-            wp_send_json_error(array(
-                'message' => __('Invalid timeframe', 'wc-realtime-analytics')
-            ), 400);
-            exit;
-        }
-        
-        // Get date range for custom timeframe
-        $from_date = '';
-        $to_date = '';
-        
-        if ($timeframe === 'custom') {
-            $from_date = isset($_POST['from_date']) ? sanitize_text_field($_POST['from_date']) : '';
-            $to_date = isset($_POST['to_date']) ? sanitize_text_field($_POST['to_date']) : '';
-            
-            // Validate date format
-            if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $from_date) || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $to_date)) {
-                wp_send_json_error(array(
-                    'message' => __('Invalid date format', 'wc-realtime-analytics')
-                ), 400);
-                exit;
-            }
-        }
-        
-        // Get statistics based on timeframe
-        $stats = array();
-        
-        try {
-            switch ($timeframe) {
-                case 'today':
-                    $stats = $this->db->get_today_stats();
-                    break;
-                    
-                case 'yesterday':
-                    $stats = $this->db->get_yesterday_stats();
-                    break;
-                    
-                case 'this_week':
-                    $stats = $this->db->get_this_week_stats();
-                    break;
-                    
-                case 'this_month':
-                    $stats = $this->db->get_this_month_stats();
-                    break;
-                    
-                case 'last_7_days':
-                    $stats = $this->db->get_last_7_days_stats();
-                    break;
-                    
-                case 'last_30_days':
-                    $stats = $this->db->get_last_30_days_stats();
-                    break;
-                    
-                case 'custom':
-                    if (!empty($from_date) && !empty($to_date)) {
-                        $stats = $this->db->get_custom_range_stats($from_date, $to_date);
-                    } else {
-                        $stats = $this->db->get_today_stats();
-                    }
-                    break;
-                    
-                default:
-                    $stats = $this->db->get_today_stats();
-                    break;
-            }
-            
-            // Ensure we have a properly structured response
-            if (!isset($stats['store']) || !isset($stats['products']) || !isset($stats['countries'])) {
-                $stats = array(
-                    'store' => isset($stats['store']) ? $stats['store'] : array(),
-                    'products' => isset($stats['products']) ? $stats['products'] : array(),
-                    'countries' => isset($stats['countries']) ? $stats['countries'] : array()
-                );
-            }
-            
-            wp_send_json_success($stats);
-        } catch (Exception $e) {
-            wp_send_json_error(array(
-                'message' => $e->getMessage()
-            ), 500);
-        }
-    }
+                               <option value="ap4" <?php selected(get_option('wc_realtime_pusher_cluster'), 'ap4'); ?>>ap4 (Asia Pacific)</option>
+                           </select>
+                       </td>
+                   </tr>
+               </table>
+               
+               <p class="submit">
+                   <input type="submit" name="wc_realtime_save_settings" class="button-primary" value="<?php esc_attr_e('Save Settings', 'wc-realtime-analytics'); ?>" />
+               </p>
+           </form>
+           
+           <hr>
+           
+           <h2><?php _e('Setup Instructions', 'wc-realtime-analytics'); ?></h2>
+           <ol>
+               <li><?php printf(
+                   esc_html__('Create a free account at %s', 'wc-realtime-analytics'),
+                   '<a href="https://pusher.com/" target="_blank">Pusher.com</a>'
+               ); ?></li>
+               <li><?php esc_html_e('Create a new Channels app in your Pusher dashboard', 'wc-realtime-analytics'); ?></li>
+               <li><?php esc_html_e('Copy the App ID, Key, and Secret from your Pusher app', 'wc-realtime-analytics'); ?></li>
+               <li><?php esc_html_e('Select the appropriate cluster for your region', 'wc-realtime-analytics'); ?></li>
+               <li><?php esc_html_e('Enter these details above and save the settings', 'wc-realtime-analytics'); ?></li>
+           </ol>
+           
+           <p><?php esc_html_e('Once configured, real-time analytics will begin tracking automatically.', 'wc-realtime-analytics'); ?></p>
+       </div>
+       <?php
+   }
+   
+   /**
+    * AJAX handler to get statistics
+    */
+   public function ajax_get_stats() {
+       // Verify nonce
+       if (!isset($_POST['nonce']) || !wp_verify_nonce(sanitize_text_field($_POST['nonce']), 'wc_realtime_admin_nonce')) {
+           wp_send_json_error(array(
+               'message' => __('Security check failed', 'wc-realtime-analytics')
+           ), 403);
+           exit;
+       }
+       
+       // Check capability
+       if (!current_user_can('manage_woocommerce')) {
+           wp_send_json_error(array(
+               'message' => __('Permission denied', 'wc-realtime-analytics')
+           ), 403);
+           exit;
+       }
+       
+       // Get timeframe parameter
+       $timeframe = isset($_POST['timeframe']) ? sanitize_text_field($_POST['timeframe']) : 'today';
+       
+       // Validate timeframe
+       $valid_timeframes = array(
+           'today', 'yesterday', 'this_week', 'this_month', 
+           'last_7_days', 'last_30_days', 'custom'
+       );
+       
+       if (!in_array($timeframe, $valid_timeframes, true)) {
+           wp_send_json_error(array(
+               'message' => __('Invalid timeframe', 'wc-realtime-analytics')
+           ), 400);
+           exit;
+       }
+       
+       // Get date range for custom timeframe
+       $from_date = '';
+       $to_date = '';
+       
+       if ($timeframe === 'custom') {
+           $from_date = isset($_POST['from_date']) ? sanitize_text_field($_POST['from_date']) : '';
+           $to_date = isset($_POST['to_date']) ? sanitize_text_field($_POST['to_date']) : '';
+           
+           // Validate date format
+           if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $from_date) || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $to_date)) {
+               wp_send_json_error(array(
+                   'message' => __('Invalid date format', 'wc-realtime-analytics')
+               ), 400);
+               exit;
+           }
+       }
+       
+       // Get statistics based on timeframe
+       $stats = array();
+       
+       try {
+           switch ($timeframe) {
+               case 'today':
+                   $stats = $this->db->get_today_stats();
+                   break;
+                   
+               case 'yesterday':
+                   $stats = $this->db->get_yesterday_stats();
+                   break;
+                   
+               case 'this_week':
+                   $stats = $this->db->get_this_week_stats();
+                   break;
+                   
+               case 'this_month':
+                   $stats = $this->db->get_this_month_stats();
+                   break;
+                   
+               case 'last_7_days':
+                   $stats = $this->db->get_last_7_days_stats();
+                   break;
+                   
+               case 'last_30_days':
+                   $stats = $this->db->get_last_30_days_stats();
+                   break;
+                   
+               case 'custom':
+                   if (!empty($from_date) && !empty($to_date)) {
+                       $stats = $this->db->get_custom_range_stats($from_date, $to_date);
+                   } else {
+                       $stats = $this->db->get_today_stats();
+                   }
+                   break;
+                   
+               default:
+                   $stats = $this->db->get_today_stats();
+                   break;
+           }
+           
+           // Ensure we have a properly structured response
+           if (!isset($stats['store']) || !isset($stats['products']) || !isset($stats['countries'])) {
+               $stats = array(
+                   'store' => isset($stats['store']) ? $stats['store'] : array(),
+                   'products' => isset($stats['products']) ? $stats['products'] : array(),
+                   'countries' => isset($stats['countries']) ? $stats['countries'] : array()
+               );
+           }
+           
+           wp_send_json_success($stats);
+       } catch (Exception $e) {
+           wp_send_json_error(array(
+               'message' => $e->getMessage()
+           ), 500);
+       }
+   }
+   
+   /**
+    * AJAX handler to test Pusher event
+    */
+   public function ajax_test_event() {
+       // Verify nonce
+       if (!isset($_POST['nonce']) || !wp_verify_nonce(sanitize_text_field($_POST['nonce']), 'wc_realtime_admin_nonce')) {
+           wp_send_json_error(array(
+               'message' => __('Security check failed', 'wc-realtime-analytics')
+           ), 403);
+           exit;
+       }
+       
+       // Check capability
+       if (!current_user_can('manage_options')) {
+           wp_send_json_error(array(
+               'message' => __('Permission denied', 'wc-realtime-analytics')
+           ), 403);
+           exit;
+       }
+       
+       // Get test data
+       $test_data = array(
+           'message' => 'Test event from admin dashboard',
+           'timestamp' => current_time('mysql'),
+           'user_id' => get_current_user_id(),
+           'product_id' => 0,
+           'country_code' => 'TEST',
+           'country_name' => 'Test Country'
+       );
+       
+       // Try to send a test event
+       $result = $this->pusher->trigger('wc-analytics', 'test', $test_data);
+       
+       if ($result === true || (is_array($result) && isset($result['status']) && $result['status'] === 200)) {
+           wp_send_json_success(array(
+               'message' => __('Test event sent successfully', 'wc-realtime-analytics')
+           ));
+       } else {
+           wp_send_json_error(array(
+               'message' => __('Failed to send test event', 'wc-realtime-analytics'),
+               'error' => is_array($result) ? print_r($result, true) : 'Unknown error'
+           ));
+       }
+   }
 }
+                                

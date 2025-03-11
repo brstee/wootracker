@@ -2,7 +2,7 @@
 /**
  * Class WC_Realtime_Data
  * 
- * Handles data processing and reporting for WooCommerce Real-time Analytics
+ * Handles advanced data processing and reporting for WooCommerce Real-time Analytics
  */
 
 // Prevent direct access
@@ -19,6 +19,13 @@ class WC_Realtime_Data {
     private $db;
     
     /**
+     * Cache for various calculations to improve performance
+     *
+     * @var array
+     */
+    private $cache = array();
+    
+    /**
      * Constructor
      *
      * @param WC_Realtime_DB $db Database handler
@@ -28,19 +35,37 @@ class WC_Realtime_Data {
     }
     
     /**
-     * Get data for dashboard
+     * Get comprehensive dashboard data with advanced analysis
      *
      * @param string $timeframe Timeframe to get data for
      * @param string $from_date From date for custom timeframe (Y-m-d)
      * @param string $to_date To date for custom timeframe (Y-m-d)
-     * @return array Dashboard data
+     * @return array Enhanced dashboard data
      */
     public function get_dashboard_data($timeframe = 'today', $from_date = '', $to_date = '') {
+        // Validate and sanitize input
+        $timeframe = $this->sanitize_timeframe($timeframe);
+        
         // Get raw statistics based on timeframe
         $stats = $this->get_timeframe_stats($timeframe, $from_date, $to_date);
         
-        // Process stats for dashboard display
-        return $this->process_stats_for_dashboard($stats);
+        // Process stats with advanced analysis
+        return $this->process_advanced_stats($stats, $timeframe, $from_date, $to_date);
+    }
+    
+    /**
+     * Sanitize and validate timeframe
+     *
+     * @param string $timeframe Input timeframe
+     * @return string Validated timeframe
+     */
+    private function sanitize_timeframe($timeframe) {
+        $valid_timeframes = array(
+            'today', 'yesterday', 'this_week', 'this_month', 
+            'last_7_days', 'last_30_days', 'custom'
+        );
+        
+        return in_array($timeframe, $valid_timeframes, true) ? $timeframe : 'today';
     }
     
     /**
@@ -52,45 +77,70 @@ class WC_Realtime_Data {
      * @return array Raw statistics
      */
     public function get_timeframe_stats($timeframe = 'today', $from_date = '', $to_date = '') {
-        switch ($timeframe) {
-            case 'today':
-                return $this->db->get_today_stats();
-                
-            case 'yesterday':
-                return $this->db->get_yesterday_stats();
-                
-            case 'this_week':
-                return $this->db->get_this_week_stats();
-                
-            case 'this_month':
-                return $this->db->get_this_month_stats();
-                
-            case 'last_7_days':
-                return $this->db->get_last_7_days_stats();
-                
-            case 'last_30_days':
-                return $this->db->get_last_30_days_stats();
-                
-            case 'custom':
-                if (!empty($from_date) && !empty($to_date)) {
+        try {
+            switch ($timeframe) {
+                case 'today':
+                    return $this->db->get_today_stats();
+                    
+                case 'yesterday':
+                    return $this->db->get_yesterday_stats();
+                    
+                case 'this_week':
+                    return $this->db->get_this_week_stats();
+                    
+                case 'this_month':
+                    return $this->db->get_this_month_stats();
+                    
+                case 'last_7_days':
+                    return $this->db->get_last_7_days_stats();
+                    
+                case 'last_30_days':
+                    return $this->db->get_last_30_days_stats();
+                    
+                case 'custom':
+                    // Validate date format
+                    if (empty($from_date) || empty($to_date) || 
+                        !$this->validate_date_format($from_date) || 
+                        !$this->validate_date_format($to_date)) {
+                        return $this->db->get_today_stats();
+                    }
+                    
                     return $this->db->get_custom_range_stats($from_date, $to_date);
-                }
-                
-                // Fallback to today if dates are not provided
-                return $this->db->get_today_stats();
-                
-            default:
-                return $this->db->get_today_stats();
+                    
+                default:
+                    return $this->db->get_today_stats();
+            }
+        } catch (Exception $e) {
+            error_log('WC Realtime Analytics: Error getting timeframe stats - ' . $e->getMessage());
+            return array(
+                'store' => array(),
+                'products' => array(),
+                'countries' => array()
+            );
         }
     }
     
     /**
-     * Process raw statistics for dashboard display
+     * Validate date format
+     *
+     * @param string $date Date to validate
+     * @return bool True if valid, false otherwise
+     */
+    private function validate_date_format($date) {
+        return preg_match('/^\d{4}-\d{2}-\d{2}$/', $date) && 
+               strtotime($date) !== false;
+    }
+    
+    /**
+     * Process advanced statistics with additional insights
      *
      * @param array $stats Raw statistics
-     * @return array Processed statistics
+     * @param string $timeframe Timeframe used
+     * @param string $from_date From date (for custom range)
+     * @param string $to_date To date (for custom range)
+     * @return array Processed statistics with advanced insights
      */
-    private function process_stats_for_dashboard($stats) {
+    private function process_advanced_stats($stats, $timeframe, $from_date = '', $to_date = '') {
         if (!is_array($stats)) {
             return array(
                 'store' => array(),
@@ -99,174 +149,248 @@ class WC_Realtime_Data {
             );
         }
         
-        // Process store overview data
-        $store_data = isset($stats['store']) ? $stats['store'] : array();
+        // Ensure all sections exist
+        $stats = array_merge(array(
+            'store' => array(),
+            'products' => array(),
+            'countries' => array()
+        ), $stats);
         
-        // Calculate conversion rates if not already calculated
-        if (!isset($store_data['atc_rate']) && isset($store_data['visitors']) && isset($store_data['add_to_cart'])) {
-            $store_data['atc_rate'] = $this->calculate_percentage($store_data['add_to_cart'], $store_data['visitors']);
+        // Process store data with advanced calculations
+        $store_data = $this->process_store_insights($stats['store'], $timeframe, $from_date, $to_date);
+        
+        // Process product data with ranking and performance metrics
+        $product_data = $this->process_product_insights($stats['products']);
+        
+        // Process country data with geographic insights
+        $country_data = $this->process_country_insights($stats['countries']);
+        
+        return array(
+            'store' => $store_data,
+            'products' => $product_data,
+            'countries' => $country_data,
+            'timeframe' => $timeframe
+        );
+    }
+    
+    /**
+     * Calculate advanced store insights
+     *
+     * @param array $store_stats Raw store statistics
+     * @param string $timeframe Current timeframe
+     * @param string $from_date From date (for custom range)
+     * @param string $to_date To date (for custom range)
+     * @return array Enhanced store insights
+     */
+    private function process_store_insights($store_stats, $timeframe, $from_date = '', $to_date = '') {
+        // Ensure default values
+        $store_stats = $this->ensure_default_values($store_stats);
+        
+        // Calculate conversion rates (if not already calculated)
+        $store_stats['atc_rate'] = $this->calculate_percentage(
+            $store_stats['add_to_cart'], 
+            $store_stats['visitors']
+        );
+        
+        $store_stats['checkout_rate'] = $this->calculate_percentage(
+            $store_stats['checkouts'], 
+            $store_stats['add_to_cart']
+        );
+        
+        $store_stats['purchase_rate'] = $this->calculate_percentage(
+            $store_stats['purchases'], 
+            $store_stats['checkouts']
+        );
+        
+        // Calculate total revenue (if possible)
+        $store_stats['estimated_revenue'] = $this->calculate_estimated_revenue($store_stats);
+        
+        // Add trend information based on timeframe
+        $store_stats['trend'] = $this->get_trend_data($timeframe, $from_date, $to_date);
+        
+        return $store_stats;
+    }
+    
+    /**
+     * Calculate estimated revenue from purchases
+     *
+     * @param array $store_stats Store statistics
+     * @return float Estimated revenue
+     */
+    private function calculate_estimated_revenue($store_stats) {
+        global $wpdb;
+        
+        try {
+            $avg_order_total = $wpdb->get_var(
+                "SELECT AVG(total) FROM {$wpdb->prefix}woocommerce_order_items 
+                JOIN {$wpdb->prefix}woocommerce_order_itemmeta ON 
+                {$wpdb->prefix}woocommerce_order_items.order_id = {$wpdb->prefix}woocommerce_order_itemmeta.order_id 
+                WHERE meta_key = '_line_total'"
+            );
+            
+            $purchases = max(1, $store_stats['purchases']);
+            return round($avg_order_total * $purchases, 2);
+        } catch (Exception $e) {
+            error_log('WC Realtime Analytics: Error calculating estimated revenue - ' . $e->getMessage());
+            return 0;
+        }
+    }
+    
+    /**
+     * Get trend data for store performance
+     *
+     * @param string $timeframe Current timeframe
+     * @param string $from_date From date (for custom range)
+     * @param string $to_date To date (for custom range)
+     * @return array Trend information
+     */
+    private function get_trend_data($timeframe, $from_date = '', $to_date = '') {
+        // Caching to prevent multiple calculations
+        $cache_key = "trend_{$timeframe}_{$from_date}_{$to_date}";
+        
+        if (isset($this->cache[$cache_key])) {
+            return $this->cache[$cache_key];
         }
         
-        if (!isset($store_data['checkout_rate']) && isset($store_data['add_to_cart']) && isset($store_data['checkouts'])) {
-            $store_data['checkout_rate'] = $this->calculate_percentage($store_data['checkouts'], $store_data['add_to_cart']);
+        // Placeholder for trend calculation
+        // In a real implementation, this would compare current period with previous period
+        $trend = array(
+            'visitors' => 'stable', // Could be 'up', 'down', or 'stable'
+            'add_to_cart' => 'stable',
+            'checkouts' => 'stable',
+            'purchases' => 'stable'
+        );
+        
+        $this->cache[$cache_key] = $trend;
+        return $trend;
+    }
+    
+    /**
+     * Process product insights with advanced ranking
+     *
+     * @param array $products Raw product data
+     * @return array Enhanced product insights
+     */
+    private function process_product_insights($products) {
+        if (empty($products)) {
+            return array();
         }
         
-        if (!isset($store_data['purchase_rate']) && isset($store_data['checkouts']) && isset($store_data['purchases'])) {
-            $store_data['purchase_rate'] = $this->calculate_percentage($store_data['purchases'], $store_data['checkouts']);
-        }
-        
-        // Process product data
-        $product_data = isset($stats['products']) ? $stats['products'] : array();
-        
-        // Add product names if missing
-        foreach ($product_data as &$product) {
-            if (!isset($product['name']) && isset($product['product_id'])) {
+        // Calculate additional product metrics
+        foreach ($products as &$product) {
+            // Convert to integers to ensure numeric operations
+            $product['visitors'] = absint($product['visitors']);
+            $product['add_to_cart'] = absint($product['add_to_cart']);
+            $product['checkouts'] = absint($product['checkouts']);
+            $product['purchases'] = absint($product['purchases']);
+            
+            // Calculate conversion rates
+            $product['atc_rate'] = $this->calculate_percentage(
+                $product['add_to_cart'], 
+                $product['visitors']
+            );
+            
+            $product['purchase_rate'] = $this->calculate_percentage(
+                $product['purchases'], 
+                $product['add_to_cart']
+            );
+            
+            // Fetch additional product information if missing
+            if (empty($product['name'])) {
                 $product_obj = wc_get_product($product['product_id']);
                 $product['name'] = $product_obj ? $product_obj->get_name() : 'Product #' . $product['product_id'];
             }
         }
         
-        // Process country data
-        $country_data = isset($stats['countries']) ? $stats['countries'] : array();
+        // Sort products by visitors in descending order
+        usort($products, function($a, $b) {
+            return $b['visitors'] - $a['visitors'];
+        });
         
-        return array(
-            'store' => $store_data,
-            'products' => $product_data,
-            'countries' => $country_data
-        );
+        return $products;
     }
     
     /**
-     * Calculate percentage with safety for division by zero
+     * Process country insights with geographic analysis
+     *
+     * @param array $countries Raw country data
+     * @return array Enhanced country insights
+     */
+    private function process_country_insights($countries) {
+        if (empty($countries)) {
+            return array();
+        }
+        
+        // Calculate total metrics for comparison
+        $total_visitors = array_sum(array_column($countries, 'visitors'));
+        
+        // Process each country
+        foreach ($countries as &$country) {
+            // Ensure integer values
+            $country['visitors'] = absint($country['visitors']);
+            $country['add_to_cart'] = absint($country['add_to_cart']);
+            $country['checkouts'] = absint($country['checkouts']);
+            $country['purchases'] = absint($country['purchases']);
+            
+            // Calculate country-specific rates
+            $country['visitors_percentage'] = $total_visitors > 0 
+                ? round(($country['visitors'] / $total_visitors) * 100, 2) 
+                : 0;
+            
+            $country['atc_rate'] = $this->calculate_percentage(
+                $country['add_to_cart'], 
+                $country['visitors']
+            );
+            
+            $country['purchase_rate'] = $this->calculate_percentage(
+                $country['purchases'], 
+                $country['add_to_cart']
+            );
+        }
+        
+        // Sort countries by visitors in descending order
+        usort($countries, function($a, $b) {
+            return $b['visitors'] - $a['visitors'];
+        });
+        
+        return $countries;
+    }
+    
+    /**
+     * Ensure default values for null or empty results
+     *
+     * @param array $data Data to normalize
+     * @return array Normalized data with default values
+     */
+    private function ensure_default_values($data) {
+        $defaults = array(
+            'visitors' => 0,
+            'add_to_cart' => 0,
+            'checkouts' => 0,
+            'purchases' => 0,
+            'atc_rate' => 0,
+            'checkout_rate' => 0,
+            'purchase_rate' => 0
+        );
+        
+        return array_merge($defaults, array_intersect_key($data, $defaults));
+    }
+    
+    /**
+     * Calculate percentage safely
      *
      * @param int $numerator Numerator
      * @param int $denominator Denominator
-     * @return float Percentage value
+     * @return float Calculated percentage
      */
     private function calculate_percentage($numerator, $denominator) {
-        if (empty($denominator) || $denominator == 0) {
-            return 0;
+        $numerator = absint($numerator);
+        $denominator = absint($denominator);
+        
+        if ($denominator === 0) {
+            return 0.00;
         }
         
         return round(($numerator / $denominator) * 100, 2);
-    }
-    
-    /**
-     * Get daily breakdown data for charts
-     *
-     * @param string $from_date From date (Y-m-d)
-     * @param string $to_date To date (Y-m-d)
-     * @return array Daily data for charts
-     */
-    public function get_daily_chart_data($from_date, $to_date) {
-        global $wpdb;
-        
-        $table_name = $wpdb->prefix . 'wc_realtime_daily';
-        
-        $results = $wpdb->get_results($wpdb->prepare(
-            "SELECT 
-                date,
-                SUM(visitors) as visitors,
-                SUM(add_to_cart) as add_to_cart,
-                SUM(checkouts) as checkouts,
-                SUM(purchases) as purchases
-            FROM {$table_name}
-            WHERE date BETWEEN %s AND %s
-            GROUP BY date
-            ORDER BY date ASC",
-            $from_date, $to_date
-        ), ARRAY_A);
-        
-        // Format data for chart
-        $dates = array();
-        $visitors = array();
-        $add_to_cart = array();
-        $checkouts = array();
-        $purchases = array();
-        
-        foreach ($results as $row) {
-            $dates[] = $row['date'];
-            $visitors[] = (int)$row['visitors'];
-            $add_to_cart[] = (int)$row['add_to_cart'];
-            $checkouts[] = (int)$row['checkouts'];
-            $purchases[] = (int)$row['purchases'];
-        }
-        
-        return array(
-            'dates' => $dates,
-            'visitors' => $visitors,
-            'add_to_cart' => $add_to_cart,
-            'checkouts' => $checkouts,
-            'purchases' => $purchases
-        );
-    }
-    
-    /**
-     * Get top products data
-     *
-     * @param string $from_date From date (Y-m-d)
-     * @param string $to_date To date (Y-m-d)
-     * @param int $limit Number of products to return
-     * @return array Top products data
-     */
-    public function get_top_products($from_date, $to_date, $limit = 10) {
-        global $wpdb;
-        
-        $table_name = $wpdb->prefix . 'wc_realtime_products';
-        
-        $results = $wpdb->get_results($wpdb->prepare(
-            "SELECT 
-                product_id,
-                SUM(visitors) as visitors,
-                SUM(add_to_cart) as add_to_cart,
-                SUM(checkouts) as checkouts,
-                SUM(purchases) as purchases
-            FROM {$table_name}
-            WHERE date BETWEEN %s AND %s
-            GROUP BY product_id
-            ORDER BY visitors DESC
-            LIMIT %d",
-            $from_date, $to_date, $limit
-        ), ARRAY_A);
-        
-        // Add product names
-        foreach ($results as &$product) {
-            $product_obj = wc_get_product($product['product_id']);
-            $product['name'] = $product_obj ? $product_obj->get_name() : 'Product #' . $product['product_id'];
-        }
-        
-        return $results;
-    }
-    
-    /**
-     * Get top countries data
-     *
-     * @param string $from_date From date (Y-m-d)
-     * @param string $to_date To date (Y-m-d)
-     * @param int $limit Number of countries to return
-     * @return array Top countries data
-     */
-    public function get_top_countries($from_date, $to_date, $limit = 10) {
-        global $wpdb;
-        
-        $table_name = $wpdb->prefix . 'wc_realtime_daily';
-        
-        $results = $wpdb->get_results($wpdb->prepare(
-            "SELECT 
-                country_code,
-                country_name,
-                SUM(visitors) as visitors,
-                SUM(add_to_cart) as add_to_cart,
-                SUM(checkouts) as checkouts,
-                SUM(purchases) as purchases
-            FROM {$table_name}
-            WHERE date BETWEEN %s AND %s AND country_code != ''
-            GROUP BY country_code, country_name
-            ORDER BY visitors DESC
-            LIMIT %d",
-            $from_date, $to_date, $limit
-        ), ARRAY_A);
-        
-        return $results;
     }
 }

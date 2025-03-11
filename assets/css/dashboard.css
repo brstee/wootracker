@@ -135,6 +135,7 @@
     color: #888;
     font-size: 12px;
     width: 60px;
+    flex-shrink: 0;
 }
 
 .wc-realtime-event-icon {
@@ -160,9 +161,18 @@
     background-color: #9C27B0;
 }
 
+.wc-realtime-event-test .wc-realtime-event-icon {
+    background-color: #607D8B;
+}
+
+.wc-realtime-event-unknown .wc-realtime-event-icon {
+    background-color: #9E9E9E;
+}
+
 .wc-realtime-event-text {
     flex-grow: 1;
     font-size: 13px;
+    line-height: 1.4;
     /* Prevent XSS via CSS */
     max-width: 100%;
 }
@@ -219,6 +229,25 @@
     color: #e53935;
 }
 
+/* Debug Section */
+#wcra-debug-section {
+    margin-top: 30px;
+    padding: 20px;
+    border-top: 1px solid #ddd;
+    background: #f8f8f8;
+}
+
+#wcra-debug-output {
+    margin-top: 10px;
+    padding: 10px;
+    background: #fff;
+    border: 1px solid #ddd;
+    height: 100px;
+    overflow: auto;
+    font-family: monospace;
+    font-size: 12px;
+}
+
 /* Animations */
 @keyframes pulse {
     0% { transform: scale(1); }
@@ -258,4 +287,17 @@
 .wc-realtime-event-text,
 .wc-realtime-table td {
     contain: content;
+}
+
+/* Connection status colors */
+.wc-realtime-empty-state.connected {
+    color: #4CAF50;
+}
+
+.wc-realtime-empty-state.connecting {
+    color: #FF9800;
+}
+
+.wc-realtime-empty-state.error {
+    color: #F44336;
 }
